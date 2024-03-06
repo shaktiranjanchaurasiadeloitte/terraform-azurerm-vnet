@@ -1,152 +1,85 @@
-terraform {
-  required_providers {
-    azurerm = ">= 2.8.0" // For move to address_prefixes
-  }
-}
+#Azure Generic vNet Module
+data "azurerm_resource_group" "network" {
+  count = var.resource_group_location == null ? 1 : 0
 
-data "azurerm_client_config" "current" {}
-
-locals {
-  service_endpoints = {
-    for subnet in keys(var.service_endpoints) :
-    subnet => [
-      for service in var.service_endpoints[subnet] :
-      "Microsoft.${trimprefix(service, "Microsoft.")}"
-    ]
-  }
-
-  // Only one DDOS Protection Plan per region
-  ddos_vnet = toset(var.ddos ? ["Standard"] : [])
-
-  // Create arrays for peering
-  hub_vnet = length(var.hub_vnet_id) == 0 ? {} : {
-      resource_group_name  = split("/", var.hub_vnet_id)[4]
-      vnet_name            = split("/", var.hub_vnet_id)[8]
-      id                   = var.hub_vnet_id
-  }
-
-  spoke_to_hub = toset(length(var.hub_vnet_id) > 0 ? ["${var.vnet_name}_to_${local.hub_vnet.vnet_name}"] : [])
-  hub_to_spoke = toset(length(var.hub_vnet_id) > 0 ? ["${local.hub_vnet.vnet_name}_to_${var.vnet_name}"] : [])
-
-  vpngw = toset(length(var.vpngw_name) > 0 ? [var.vpngw_name]: [])
-
-}
-
-data "azurerm_resource_group" "vnet" {
   name = var.resource_group_name
 }
 
-resource "azurerm_network_ddos_protection_plan" "ddos" {
-  for_each = local.ddos_vnet
-  name     = each.value
-
-  resource_group_name = data.azurerm_resource_group.vnet.name
-  location            = length(var.location) > 0 ? var.location : data.azurerm_resource_group.vnet.location
-  tags                = length(var.tags) > 0 ? var.tags : data.azurerm_resource_group.vnet.tags
-
-  lifecycle {
-    ignore_changes = [tags]
-  }
+locals {
+  resource_group_location = var.resource_group_location == null ? data.azurerm_resource_group.network[0].location : var.resource_group_location
 }
 
 resource "azurerm_virtual_network" "vnet" {
+  address_space       = length(var.address_spaces) == 0 ? [var.address_space] : var.address_spaces
+  location            = local.resource_group_location
   name                = var.vnet_name
-  resource_group_name = data.azurerm_resource_group.vnet.name
-  location            = length(var.location) > 0 ? var.location : data.azurerm_resource_group.vnet.location
-  tags                = length(var.tags) > 0 ? var.tags : data.azurerm_resource_group.vnet.tags
-  depends_on          = [var.module_depends_on]
+  resource_group_name = var.resource_group_name
+  dns_servers         = var.dns_servers
+  tags = merge(var.tags, (/*<box>*/ (var.tracing_tags_enabled ? { for k, v in /*</box>*/ {
+    avm_git_commit           = "c506f86f75a34ad34c2b4437e8076f1f06bf6a00"
+    avm_git_file             = "main.tf"
+    avm_git_last_modified_at = "2022-11-23 09:20:55"
+    avm_git_org              = "Azure"
+    avm_git_repo             = "terraform-azurerm-network"
+    avm_yor_trace            = "7f614813-224a-46c0-91d7-855dc7d6d5db"
+    } /*<box>*/ : replace(k, "avm_", var.tracing_tags_prefix) => v } : {}) /*</box>*/), (/*<box>*/ (var.tracing_tags_enabled ? { for k, v in /*</box>*/ {
+    avm_yor_name = "vnet"
+  } /*<box>*/ : replace(k, "avm_", var.tracing_tags_prefix) => v } : {}) /*</box>*/))
+}
 
-  address_space = var.address_space
-  dns_servers   = var.dns_servers
+moved {
+  from = azurerm_subnet.subnet
+  to   = azurerm_subnet.subnet_count
+}
 
-  dynamic "ddos_protection_plan" {
-    for_each = local.ddos_vnet
+resource "azurerm_subnet" "subnet_count" {
+  count = var.use_for_each ? 0 : length(var.subnet_names)
+
+  address_prefixes                               = [var.subnet_prefixes[count.index]]
+  name                                           = var.subnet_names[count.index]
+  resource_group_name                            = var.resource_group_name
+  virtual_network_name                           = azurerm_virtual_network.vnet.name
+  enforce_private_link_endpoint_network_policies = lookup(var.subnet_enforce_private_link_endpoint_network_policies, var.subnet_names[count.index], false)
+  service_endpoints                              = lookup(var.subnet_service_endpoints, var.subnet_names[count.index], [])
+
+  dynamic "delegation" {
+    for_each = lookup(var.subnet_delegation, var.subnet_names[count.index], [])
+
     content {
-      id     = azurerm_network_ddos_protection_plan.ddos[ddos_protection_plan.value].id
-      enable = true
+      name = delegation.value.name
+
+      service_delegation {
+        name    = delegation.value.service_delegation.name
+        actions = delegation.value.service_delegation.actions
+      }
     }
   }
+}
 
-  lifecycle {
-    ignore_changes = [tags]
+resource "azurerm_subnet" "subnet_for_each" {
+  for_each = var.use_for_each ? toset(var.subnet_names) : []
+
+  address_prefixes                               = [local.subnet_names_prefixes_map[each.value]]
+  name                                           = each.value
+  resource_group_name                            = var.resource_group_name
+  virtual_network_name                           = azurerm_virtual_network.vnet.name
+  enforce_private_link_endpoint_network_policies = lookup(var.subnet_enforce_private_link_endpoint_network_policies, each.value, false)
+  service_endpoints                              = lookup(var.subnet_service_endpoints, each.value, [])
+
+  dynamic "delegation" {
+    for_each = lookup(var.subnet_delegation, each.value, [])
+
+    content {
+      name = delegation.value.name
+
+      service_delegation {
+        name    = delegation.value.service_delegation.name
+        actions = delegation.value.service_delegation.actions
+      }
+    }
   }
 }
 
-resource "azurerm_subnet" "subnet" {
-  resource_group_name  = data.azurerm_resource_group.vnet.name
-  virtual_network_name = azurerm_virtual_network.vnet.name
-
-  for_each = var.subnets
-
-  name              = each.key
-  address_prefixes  = flatten([each.value])
-  service_endpoints = contains(keys(local.service_endpoints), each.key) ? local.service_endpoints[each.key] : null
-}
-
-resource "azurerm_subnet_network_security_group_association" "subnet" {
-  for_each = var.nsgs
-
-  subnet_id                 = azurerm_subnet.subnet[each.key].id
-  network_security_group_id = each.value
-}
-
-resource "azurerm_virtual_network_peering" "spoke_to_hub" {
-  for_each                  = local.spoke_to_hub
-
-  name                      = each.value
-  resource_group_name       = azurerm_virtual_network.vnet.resource_group_name
-  virtual_network_name      = azurerm_virtual_network.vnet.name
-  remote_virtual_network_id = local.hub_vnet.id
-
-  allow_virtual_network_access = true
-  allow_forwarded_traffic      = false
-  allow_gateway_transit        = false
-  use_remote_gateways          = true
-}
-
-resource "azurerm_virtual_network_peering" "hub_to_spoke" {
-  for_each                  = local.hub_to_spoke
-
-  name                      = each.value
-  resource_group_name       = local.hub_vnet.resource_group_name
-  virtual_network_name      = local.hub_vnet.vnet_name
-  remote_virtual_network_id = azurerm_virtual_network.vnet.id
-
-  allow_virtual_network_access = true
-  allow_forwarded_traffic      = true
-  allow_gateway_transit        = true
-  use_remote_gateways          = false
-}
-
-resource "azurerm_public_ip" "vpngw" {
-  for_each            = local.vpngw
-
-  name                = each.value
-  resource_group_name = data.azurerm_resource_group.vnet.name
-  location            = length(var.location) > 0 ? var.location : data.azurerm_resource_group.vnet.location
-  tags                = length(var.tags) > 0 ? var.tags : data.azurerm_resource_group.vnet.tags
-
-  allocation_method = "Dynamic"
-}
-
-resource "azurerm_virtual_network_gateway" "vpn" {
-  for_each            = local.vpngw
-
-  name                = each.value
-  resource_group_name = data.azurerm_resource_group.vnet.name
-  location            = length(var.location) > 0 ? var.location : data.azurerm_resource_group.vnet.location
-  tags                = length(var.tags) > 0 ? var.tags : data.azurerm_resource_group.vnet.tags
-
-  type       = "Vpn"
-  vpn_type   = var.vpngw_sku == "Basic" ? "PolicyBased" : "RouteBased"
-  enable_bgp = var.vpngw_sku == "Basic" ? false : var.vpngw_bgp
-  sku        = var.vpngw_sku
-  generation = var.vpngw_sku == "Basic" || var.vpngw_sku == "VpnGw1" ? "Generation1" : "Generation2"
-
-  ip_configuration {
-    name                          = "vpngwIpConfig"
-    public_ip_address_id          = azurerm_public_ip.vpngw[each.value].id
-    private_ip_address_allocation = "Dynamic"
-    subnet_id                     = azurerm_subnet.subnet["GatewaySubnet"].id
-  }
+locals {
+  azurerm_subnets = var.use_for_each ? [for s in azurerm_subnet.subnet_for_each : s] : [for s in azurerm_subnet.subnet_count : s]
 }
